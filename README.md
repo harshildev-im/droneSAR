@@ -1,0 +1,2 @@
+Open-source, hardware-agnostic coordination platform for multi-drone search and rescue.
+lets drones from different manufacturers work together in disaster response. It connects to PX4 and ArduPilot vehicles over MAVLink, plans and coordinates search missions, streams near real-time updates to incident command, and generates damage assessment reports for authorities. The goal is to reduce the planning load on response teams and get usable information to them faster.
