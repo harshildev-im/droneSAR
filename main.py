@@ -27,8 +27,6 @@ import shutil
 from shapely.geometry import box
 import pandas as pd 
 import threading 
-#from diasterdata import Disaster
-from gdacs_multihazard_collector import Disaster
 from datetime import datetime 
 from pathlib import Path
 import csv
@@ -2445,7 +2443,7 @@ class Display:
                 # ---------------------------------------------
                 # Create Disaster object
                 # ---------------------------------------------
-                disaster_data = Disaster(locations)
+                #disaster_data = Disaster(locations)
 
                 # ---------------------------------------------
                 # Dates: user-selected if set, otherwise today
@@ -2454,10 +2452,10 @@ class Display:
                 from_date = getattr(self, "disaster_from_date", None)
                 to_date = getattr(self, "disaster_to_date", None)
 
-                from_date, to_date = disaster_data.resolve_date_range(
+                '''from_date, to_date = disaster_data.resolve_date_range(
                     from_date,
                     to_date,
-                )
+                )'''
 
                 print("FROM:", from_date)
                 print("TO:", to_date)
@@ -2465,16 +2463,16 @@ class Display:
                 # ---------------------------------------------
                 # Get disaster data
                 # ---------------------------------------------
-                data = disaster_data.get_disaster_data(
+                '''data = disaster_data.get_disaster_data(
                     fromdate=from_date,
                     todate=to_date,
                     save=True,
-                )
+                )'''
 
                 # ---------------------------------------------
                 # Process results
                 # ---------------------------------------------
-                for city, disasters in data.items():
+                '''for city, disasters in data.items():
 
                     print()
                     print("-" * 70)
@@ -2501,13 +2499,13 @@ class Display:
                 self.disaster_data = data
 
                 print()
-                print("DISASTER CHECK COMPLETE")
+                print("DISASTER CHECK COMPLETE")'''
 
             except Exception as error:
                 Database.log_file(error)
 
             # Optional polling interval
-            self.stop_event.wait(300)  # check every 5 minutes
+            self.stop_event.wait(300)
 
     '''def disaster_worker(self):
         while not self.stop_event.is_set():
