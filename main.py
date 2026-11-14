@@ -36,6 +36,42 @@ import uuid
 import secrets
 from sitl import Drone
 
+BIG_AREA_M2 = 5000
+
+IGNORED_VOLUMES = {"Macintosh HD", "Macintosh HD - Data", "Preboot", "Recovery", "VM"}
+
+
+def find_temp_root():
+    """Return a folder on an external drive (macOS), or None if there is none."""
+    volumes_dir = "/Volumes"
+    if not os.path.isdir(volumes_dir):
+        return None
+
+    print("\nMounted volumes:")
+    external_drives = []
+    for name in os.listdir(volumes_dir):
+        print("  -", name)
+        path = os.path.join(volumes_dir, name)
+        # FIX: this check is now INSIDE the loop, so every volume is tested
+        if name not in IGNORED_VOLUMES and not name.startswith(".") and os.path.isdir(path):
+            external_drives.append(path)
+
+    if not external_drives:
+        return None
+
+    print("\nExternal drives detected:")
+    for drive in external_drives:
+        print("  -", drive)
+
+    root = os.path.join(external_drives[0], "vida_temp")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _add(d, key, value):
+    d[key] = d.get(key, 0.0) + value
+
+
 class Display:
     def __init__(self , root ,userid):
         self.root = root
@@ -92,7 +128,226 @@ class Display:
         bottom_label.pack(side='left' , padx=10)
         #self.disaster_thread.start()
         #self.root.protocol("WM_DELETE_WINDOW", self.on_close)  
-        
+    def load_building_stats(self, n_rows, n_cols):
+            """
+            Returns three (n_rows, n_cols) arrays on the WorldPop grid:
+                building_count       - buildings whose centroid is in the cell
+                avg_building_area    - mean FULL footprint (m2) of those buildings
+                total_building_area  - built area (m2) physically inside the cell
+            """
+            zip_path = filedialog.askopenfilename(
+                title="Select VIDA Open Buildings ZIP file",
+                filetypes=[("ZIP Files", "*.zip")],
+            )
+            if not zip_path:
+                raise Exception("Building ZIP file is required.")
+
+            print("\nLoading VIDA building footprints...")
+
+            # Sparse running totals, keyed by (row, col)
+            cell_count = {}        # number of buildings (centroid cell, each counted once)
+            cell_whole_area = {}   # sum of FULL footprint areas of those buildings
+            cell_total_area = {}   # built area clipped to the cell
+            source_counts = {"Google": 0, "Microsoft": 0, "OSM": 0, "Other": 0}
+            total_read = 0
+            total_assigned = 0
+
+            # FIX: one temp dir only (it was created twice before)
+            temp_root = find_temp_root()
+            if temp_root is None:
+                print("\nNo external drive found - using the system temp folder instead.")
+            temp_dir = tempfile.mkdtemp(prefix="vida_buildings_", dir=temp_root)
+            print(f"\nTemporary files: {temp_dir}")
+
+            raster_left, raster_bottom, raster_right, raster_top = array_bounds(
+                n_rows, n_cols, self.transform
+            )
+            raster_bbox = box(raster_left, raster_bottom, raster_right, raster_top)
+
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    members = sorted(
+                        m for m in zf.namelist()
+                        if m.lower().endswith((".parquet", ".geoparquet"))
+                        and "__MACOSX" not in m
+                        and not os.path.basename(m).startswith(".")
+                    )
+                    if not members:
+                        # FIX: single string (two arguments printed as a tuple before)
+                        raise Exception("No GeoParquet files were found inside the building ZIP file.")
+                    print(f"Found {len(members):,} GeoParquet/S2 files.")
+
+                    for file_index, member in enumerate(members, start=1):
+                        print(f"\nProcessing file {file_index:,}/{len(members):,}: {os.path.basename(member)}")
+
+                        # Extract ONE file at a time, process it, delete it
+                        extracted = zf.extract(member, temp_dir)
+                        try:
+                            buildings = gpd.read_parquet(extracted)
+                        finally:
+                            os.remove(extracted)
+
+                        if buildings.empty:
+                            print("  Empty file - skipped.")
+                            continue
+                        total_read += len(buildings)
+
+                        if "geometry" not in buildings.columns:
+                            print("  geometry column missing - skipped.")
+                            continue
+                        if "area_in_meters" not in buildings.columns:
+                            print("  area_in_meters column missing - skipped.")
+                            continue
+                        if buildings.crs is None:
+                            print("  CRS missing - skipped.")
+                            continue
+
+                        # Clean geometry and area
+                        buildings = buildings[
+                            buildings.geometry.notna() & ~buildings.geometry.is_empty
+                        ].copy()
+                        buildings["area_in_meters"] = pd.to_numeric(
+                            buildings["area_in_meters"], errors="coerce"
+                        )
+                        buildings = buildings[
+                            buildings["area_in_meters"].notna()
+                            & np.isfinite(buildings["area_in_meters"])
+                            & (buildings["area_in_meters"] > 0)
+                        ].copy()
+                        if buildings.empty:
+                            continue
+
+                        # Optional source statistics (case-insensitive match)
+                        if "bf_source" in buildings.columns:
+                            for src, n in buildings["bf_source"].fillna("Other").value_counts().items():
+                                match = next(
+                                    (k for k in ("Google", "Microsoft", "OSM") if k.lower() == str(src).lower()),
+                                    "Other",
+                                )
+                                source_counts[match] += int(n)
+
+                        # FIX: reproject ONCE and use this same frame for everything below
+                        if buildings.crs != self.crs:
+                            buildings = buildings.to_crs(self.crs)
+                        buildings = buildings[buildings.geometry.intersects(raster_bbox)].copy()
+                        if buildings.empty:
+                            continue
+
+                        # Centroids in a projected CRS (more accurate than degrees)
+                        if self.crs.is_geographic:
+                            bx0, by0, bx1, by1 = buildings.total_bounds
+                            mean_lon = (bx0 + bx1) / 2
+                            mean_lat = (by0 + by1) / 2
+                            zone = int((mean_lon + 180) / 6) + 1
+                            utm_epsg = (32600 if mean_lat >= 0 else 32700) + zone
+                            centroids = buildings.geometry.to_crs(epsg=utm_epsg).centroid.to_crs(self.crs)
+                        else:
+                            centroids = buildings.geometry.centroid
+
+                        xs = centroids.x.to_numpy()
+                        ys = centroids.y.to_numpy()
+                        areas = buildings["area_in_meters"].to_numpy(dtype=float)
+                        geoms = buildings.geometry.to_numpy()
+
+                        ok = np.isfinite(xs) & np.isfinite(ys)
+                        xs, ys, areas, geoms = xs[ok], ys[ok], areas[ok], geoms[ok]
+                        if len(xs) == 0:
+                            continue
+
+                        # Vectorised centroid -> (row, col)
+                        rows, cols = rowcol(self.transform, xs, ys)
+                        rows = np.asarray(rows, dtype=np.int64)
+                        cols = np.asarray(cols, dtype=np.int64)
+                        in_grid = (rows >= 0) & (rows < n_rows) & (cols >= 0) & (cols < n_cols)
+                        is_big = areas > BIG_AREA_M2
+
+                        # ---------- SMALL buildings: whole footprint -> centroid cell ----------
+                        sel = in_grid & ~is_big
+                        if sel.any():
+                            df = pd.DataFrame({
+                                "idx": rows[sel] * n_cols + cols[sel],
+                                "a": areas[sel],
+                            })
+                            agg = df.groupby("idx")["a"].agg(["count", "sum"])
+                            for idx, n, s in zip(agg.index, agg["count"], agg["sum"]):
+                                key = (int(idx // n_cols), int(idx % n_cols))
+                                _add(cell_count, key, float(n))
+                                _add(cell_whole_area, key, float(s))
+                                _add(cell_total_area, key, float(s))
+                            total_assigned += int(sel.sum())
+
+                        # ---------- BIG buildings: count once, split area across cells ----------
+                        big_idx = np.flatnonzero(is_big)
+                        for i in big_idx:
+                            geom, area = geoms[i], areas[i]
+                            if geom.is_empty or geom.area == 0:
+                                continue
+
+                            # Count it once, in its centroid cell
+                            if in_grid[i]:
+                                key = (int(rows[i]), int(cols[i]))
+                                _add(cell_count, key, 1.0)
+                                _add(cell_whole_area, key, float(area))
+                                total_assigned += 1
+
+                            # Split VIDA's area by the fraction of the footprint in each cell
+                            minx, miny, maxx, maxy = geom.bounds
+                            (ra, rb), (ca, cb) = rowcol(self.transform, [minx, maxx], [maxy, miny])
+                            r_lo, r_hi = max(min(ra, rb), 0), min(max(ra, rb), n_rows - 1)
+                            c_lo, c_hi = max(min(ca, cb), 0), min(max(ca, cb), n_cols - 1)
+                            for r in range(r_lo, r_hi + 1):
+                                for c in range(c_lo, c_hi + 1):
+                                    left, top = self.transform * (c, r)
+                                    right, bottom = self.transform * (c + 1, r + 1)
+                                    piece = geom.intersection(box(left, bottom, right, top))
+                                    if not piece.is_empty:
+                                        _add(cell_total_area, (r, c), float(area) * piece.area / geom.area)
+
+                        del buildings, centroids, geoms
+
+                        if file_index == 1 or file_index % 10 == 0 or file_index == len(members):
+                            print(f"  Buildings assigned so far: {total_assigned:,}")
+
+                print("\nBuilding processing completed.")
+                print(f"Building records read:      {total_read:,}")
+                print(f"Buildings assigned (count): {total_assigned:,}")
+                print(f"Cells containing buildings: {len(cell_total_area):,}")
+                print("\nBuilding source counts:")
+                for k in ("Google", "Microsoft", "OSM", "Other"):
+                    print(f"  {k:<10}: {source_counts[k]:,}")
+
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                print("Temporary VIDA building files removed.")
+
+            # ------------------------------------------------------------------
+            # Build the three output arrays
+            # ------------------------------------------------------------------
+            building_count = np.zeros((n_rows, n_cols), dtype=np.int32)
+            avg_building_area = np.zeros((n_rows, n_cols), dtype=np.float32)
+            total_building_area = np.zeros((n_rows, n_cols), dtype=np.float32)
+
+            for (r, c), n in cell_count.items():
+                building_count[r, c] = int(n)
+                avg_building_area[r, c] = cell_whole_area[(r, c)] / n
+            for (r, c), tot in cell_total_area.items():
+                total_building_area[r, c] = tot
+
+            print(f"\nCells with buildings: {(building_count > 0).sum():,}")
+            print(f"Total buildings:      {int(building_count.sum()):,}")
+            print(f"Total building area:  {float(total_building_area.sum()):,.0f} m2")
+
+            return building_count, avg_building_area, total_building_area
+
+
+    def save_raster(self, path, arr, dtype, n_rows, n_cols):
+            """Optional: write an array as a GeoTIFF aligned to the WorldPop grid."""
+            with rasterio.open(
+                path, "w", driver="GTiff", height=n_rows, width=n_cols, count=1,
+                dtype=dtype, crs=self.crs, transform=self.transform, nodata=0, compress="lzw",
+            ) as dst:
+                dst.write(arr.astype(dtype), 1)
+
     def start_mission(self):
         mission_window = tk.Toplevel(self.root)
         mission_window.title("Mission Planner")
@@ -3070,7 +3325,7 @@ class Display:
             # Each building is assigned to ONE WorldPop cell using its
             # centroid. The entire area_in_meters goes to that cell.
             # ==============================================================
-           file_path_buildings_zip = filedialog.askopenfilename(title="Select VIDA Open Buildings ZIP file",filetypes=[("ZIP Files", "*.zip")])
+           """file_path_buildings_zip = filedialog.askopenfilename(title="Select VIDA Open Buildings ZIP file",filetypes=[("ZIP Files", "*.zip")])
            if not file_path_buildings_zip:
                raise Exception("Building ZIP file is required.")
            print("\nLoading VIDA building footprints...")
@@ -3298,8 +3553,8 @@ class Display:
                 print(f"  Other     : {building_source_counts['Other']:,}")
            finally:
                 shutil.rmtree(building_temp_dir,ignore_errors=True)
-                print("Temporary VIDA building files removed.")
-
+                print("Temporary VIDA building files removed.")"""
+           building_count_grid, avg_building_area_grid, total_building_area_grid = self.load_building_stats(n_rows, n_cols)
             #creating database records 
            active_search_grid_no = 0 
            district_rows = (n_rows + 99) // 100
@@ -3405,15 +3660,17 @@ class Display:
                                         # =================================
                                         # BUILDING INFORMATION
                                         # =================================
-                                        building_areas = (building_areas_by_pixel.get((row, col),[]))
+                                        '''building_areas = (building_areas_by_pixel.get((row, col),[]))
                                         building_count = len(building_areas)
                                         if building_count > 0:
                                              total_building_area = sum(building_areas)
                                              average_building_area = (total_building_area/building_count)
                                         else:
                                             total_building_area = 0.0
-                                            average_building_area = 0.0
-                                        
+                                            average_building_area = 0.0'''
+                                        building_count = int(building_count_grid[row, col])
+                                        average_building_area = float(avg_building_area_grid[row, col])
+                                        total_building_area = float(total_building_area_grid[row, col])
                                         # GLOBAL GRID NUMBER
                                         active_search_grid_no += 1
 
@@ -3597,7 +3854,38 @@ class Display:
             self.tables_list.append(i[0])
         if final_name not in self.tables_list:
             try:
-                query = query = f"CREATE TABLE {final_name} (grid_no INT NOT NULL,zone_no INT NOT NULL,active_search_grid_no INT NOT NULL,center_lat DECIMAL(10,6),center_lon DECIMAL(10,6), population_density DECIMAL(10,3),elevation_m DECIMAL(10,3),slope_angle_deg DECIMAL(10,3),building_count INT ,  average_building_area DECIMAL(12,3), total_building_area DECIMAL(14,3),priority_score DECIMAL(5,3),PRIMARY KEY (active_search_grid_no), UNIQUE KEY grid_zone_idx (grid_no, zone_no, active_search_grid_no));"
+                query = query = f"""
+                    CREATE TABLE {final_name} (
+                        grid_no INT NOT NULL,
+                        zone_no INT NOT NULL,
+                        active_search_grid_no INT NOT NULL,
+
+                        center_lat DECIMAL(10,6),
+                        center_lon DECIMAL(10,6),
+
+                        population_density DECIMAL(10,3),
+                        elevation_m DECIMAL(10,3),
+                        slope_angle_deg DECIMAL(10,3),
+
+                        building_count INT,
+                        average_building_area DECIMAL(12,3),
+                        total_building_area DECIMAL(14,3),
+
+                        priority_score DECIMAL(5,3),
+
+                        dsm_file_path VARCHAR(500),
+                        dtm_file_path VARCHAR(500),
+                        flood_depth_file_path VARCHAR(500),
+
+                        PRIMARY KEY (active_search_grid_no),
+
+                        UNIQUE KEY grid_zone_idx (
+                            grid_no,
+                            zone_no,
+                            active_search_grid_no
+                        )
+                    );
+                    """
                 db.cursor.execute(query)
                 db.conn.commit()
                 file_path = filedialog.askopenfilename(
