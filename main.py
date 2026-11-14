@@ -159,7 +159,7 @@ class Display:
             temp_dir = tempfile.mkdtemp(prefix="vida_buildings_", dir=temp_root)
             print(f"\nTemporary files: {temp_dir}")
 
-            raster_left, raster_bottom, raster_right, raster_top = array_bounds(
+            raster_left, raster_bottom, raster_right, raster_top = rasterio.transform.array_bounds(
                 n_rows, n_cols, self.transform
             )
             raster_bbox = box(raster_left, raster_bottom, raster_right, raster_top)
