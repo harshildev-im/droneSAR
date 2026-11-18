@@ -163,7 +163,7 @@ class Display:
                 n_rows, n_cols, self.transform
             )
             raster_bbox = box(raster_left, raster_bottom, raster_right, raster_top)
-
+   cwefw    e
             try:
                 with zipfile.ZipFile(zip_path, "r") as zf:
                     members = sorted(
